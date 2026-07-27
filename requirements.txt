@@ -1,0 +1,8 @@
+# Install PyTorch separately first so you can choose CPU or the correct NVIDIA CUDA wheel.
+accelerate>=1.0.0,<2.0.0
+librosa>=0.10.2,<1.0.0
+numpy>=1.26.4,<3.0.0
+safetensors>=0.4.5,<1.0.0
+soundfile>=0.12.1,<1.0.0
+streamlit>=1.40.0,<2.0.0
+transformers>=4.46.0,<5.0.0
