@@ -13,6 +13,11 @@ from typing import Any
 # The model still works without Windows symlinks; this only suppresses the
 # repeated Hugging Face cache warning.
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+# This application uses PyTorch only. Avoid importing TensorFlow through
+# Transformers when TensorFlow happens to be installed in the shared venv.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 import streamlit as st
 import torch
@@ -113,6 +118,50 @@ def audio_duration(path: str) -> float | None:
         return None
 
 
+def convert_to_whisper_wav(source_path: str, wav_path: str) -> None:
+    """Decode any supported upload to 16 kHz mono PCM WAV for Whisper."""
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        source_path,
+        "-map",
+        "0:a:0",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        wav_path,
+    ]
+    try:
+        subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=None,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "Unknown FFmpeg decoding error").strip()
+        raise RuntimeError(
+            "FFmpeg could not decode this upload. The file may be incomplete, "
+            f"corrupted, or contain no audio stream.\n\n{detail}"
+        ) from exc
+
+    output = Path(wav_path)
+    if not output.exists() or output.stat().st_size <= 44:
+        raise RuntimeError(
+            "FFmpeg did not produce a valid WAV file. The upload may be malformed "
+            "or may not contain an audio stream."
+        )
+
+
 @st.cache_resource(show_spinner=False)
 def load_whisper() -> tuple[Any, str]:
     use_cuda = torch.cuda.is_available()
@@ -196,16 +245,23 @@ if uploaded:
         use_container_width=True,
         disabled=not ffmpeg_ready,
     ):
-        temp_path: str | None = None
+        source_path: str | None = None
+        wav_path: str | None = None
         try:
             with tempfile.NamedTemporaryFile(
                 delete=False,
                 suffix=Path(uploaded.name).suffix or ".audio",
             ) as temp:
                 temp.write(data)
-                temp_path = temp.name
+                source_path = temp.name
 
-            duration = audio_duration(temp_path)
+            duration = audio_duration(source_path)
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as wav_temp:
+                wav_path = wav_temp.name
+
+            with st.spinner("Decoding audio to 16 kHz mono WAV…"):
+                convert_to_whisper_wav(source_path, wav_path)
 
             with st.spinner("Loading Whisper and transcribing locally…"):
                 started = time.perf_counter()
@@ -217,7 +273,7 @@ if uploaded:
                     generate_kwargs["language"] = language
 
                 result = asr(
-                    temp_path,
+                    wav_path,
                     batch_size=int(batch_size),
                     return_timestamps=True,
                     generate_kwargs=generate_kwargs,
@@ -244,12 +300,14 @@ if uploaded:
         except Exception as exc:
             st.error(f"Transcription failed: {exc}")
             st.info(
-                "Confirm that FFmpeg is visible in this PowerShell session and "
-                "that the correct PyTorch CPU or CUDA build is installed."
+                "The app first converts the upload to a standard 16 kHz mono WAV. "
+                "If FFmpeg reports a decoding error, test the original file directly "
+                "with ffprobe or re-export the recording."
             )
         finally:
-            if temp_path:
-                Path(temp_path).unlink(missing_ok=True)
+            for temp_path in (source_path, wav_path):
+                if temp_path:
+                    Path(temp_path).unlink(missing_ok=True)
 
 if "transcript" in st.session_state:
     st.subheader("Transcript")
