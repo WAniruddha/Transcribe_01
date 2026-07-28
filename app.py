@@ -10,36 +10,34 @@ import time
 from pathlib import Path
 from typing import Any
 
-# The model still works without Windows symlinks; this only suppresses the
-# repeated Hugging Face cache warning.
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-# This application uses PyTorch only. Avoid importing TensorFlow through
-# Transformers when TensorFlow happens to be installed in the shared venv.
-os.environ.setdefault("USE_TF", "0")
-os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
+import ctranslate2
 import streamlit as st
-import torch
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+from faster_whisper import WhisperModel
 
-MODEL_ID = "openai/whisper-large-v3"
 AUDIO_TYPES = ["wav", "mp3", "m4a", "flac", "ogg", "webm", "mp4", "aac"]
+MODEL_OPTIONS = {
+    "Large v3 Turbo (recommended for CPU)": "large-v3-turbo",
+    "Large v3 (highest compute cost)": "large-v3",
+    "Medium (faster)": "medium",
+    "Small (fastest listed option)": "small",
+}
 LANGUAGES: dict[str, str | None] = {
-    "English (default)": "english",
+    "English (default)": "en",
     "Auto-detect": None,
-    "Arabic": "arabic",
-    "Chinese": "chinese",
-    "Dutch": "dutch",
-    "French": "french",
-    "German": "german",
-    "Hindi": "hindi",
-    "Italian": "italian",
-    "Japanese": "japanese",
-    "Korean": "korean",
-    "Marathi": "marathi",
-    "Portuguese": "portuguese",
-    "Spanish": "spanish",
+    "Arabic": "ar",
+    "Chinese": "zh",
+    "Dutch": "nl",
+    "French": "fr",
+    "German": "de",
+    "Hindi": "hi",
+    "Italian": "it",
+    "Japanese": "ja",
+    "Korean": "ko",
+    "Marathi": "mr",
+    "Portuguese": "pt",
+    "Spanish": "es",
 }
 UK_MAP = {
     "color": "colour", "colors": "colours", "colored": "coloured",
@@ -90,19 +88,12 @@ def ffmpeg_status() -> tuple[bool, str]:
 
 
 def audio_duration(path: str) -> float | None:
-    """Read duration with ffprobe without decoding the whole file in Python."""
     if not shutil.which("ffprobe"):
         return None
 
     command = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "json",
-        path,
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "json", path,
     ]
     try:
         completed = subprocess.run(
@@ -119,25 +110,10 @@ def audio_duration(path: str) -> float | None:
 
 
 def convert_to_whisper_wav(source_path: str, wav_path: str) -> None:
-    """Decode any supported upload to 16 kHz mono PCM WAV for Whisper."""
     command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        source_path,
-        "-map",
-        "0:a:0",
-        "-vn",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-c:a",
-        "pcm_s16le",
-        wav_path,
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", source_path, "-map", "0:a:0", "-vn",
+        "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav_path,
     ]
     try:
         subprocess.run(
@@ -156,82 +132,94 @@ def convert_to_whisper_wav(source_path: str, wav_path: str) -> None:
 
     output = Path(wav_path)
     if not output.exists() or output.stat().st_size <= 44:
-        raise RuntimeError(
-            "FFmpeg did not produce a valid WAV file. The upload may be malformed "
-            "or may not contain an audio stream."
-        )
+        raise RuntimeError("FFmpeg did not produce a valid WAV file.")
+
+
+def cuda_device_count() -> int:
+    try:
+        return int(ctranslate2.get_cuda_device_count())
+    except Exception:
+        return 0
 
 
 @st.cache_resource(show_spinner=False)
-def load_whisper() -> tuple[Any, str]:
-    use_cuda = torch.cuda.is_available()
-    dtype = torch.float16 if use_cuda else torch.float32
-    device = "cuda:0" if use_cuda else "cpu"
-
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        MODEL_ID,
-        dtype=dtype,
-        low_cpu_mem_usage=True,
-        use_safetensors=True,
+def load_whisper(
+    model_name: str,
+    device: str,
+    compute_type: str,
+    cpu_threads: int,
+) -> WhisperModel:
+    return WhisperModel(
+        model_name,
+        device=device,
+        compute_type=compute_type,
+        cpu_threads=cpu_threads,
+        num_workers=1,
     )
-    model.to(device)
 
-    processor = AutoProcessor.from_pretrained(MODEL_ID)
-    asr = pipeline(
-        "automatic-speech-recognition",
-        model=model,
-        tokenizer=processor.tokenizer,
-        feature_extractor=processor.feature_extractor,
-        chunk_length_s=30,
-        dtype=dtype,
-        device=0 if use_cuda else -1,
-        ignore_warning=True,
-    )
-    return asr, device
+
+def count_tokens(model: WhisperModel, text: str) -> int:
+    if not text:
+        return 0
+    encoded: Any = model.hf_tokenizer.encode(text)
+    return len(encoded.ids)
 
 
 st.set_page_config(page_title="Local Whisper Transcriber", page_icon="🎙️")
 st.title("🎙️ Local Whisper Transcriber")
 st.caption(
-    "Local, private transcription with openai/whisper-large-v3. "
+    "Local transcription using faster-whisper/CTranslate2. "
     "No paid transcription API is used."
 )
 
 ffmpeg_ready, ffmpeg_path = ffmpeg_status()
+cuda_count = cuda_device_count()
+logical_cpus = os.cpu_count() or 4
+default_threads = max(1, min(8, logical_cpus))
 
 with st.sidebar:
+    model_label = st.selectbox("Whisper model", list(MODEL_OPTIONS))
     language_label = st.selectbox("Spoken language", list(LANGUAGES))
     normalise = st.checkbox("Apply conservative UK spelling", value=True)
-    batch_size = st.number_input(
-        "Inference batch size",
-        min_value=1,
-        max_value=16,
-        value=4 if torch.cuda.is_available() else 1,
-        help="Use 1 on CPU or if GPU memory is limited.",
+
+    device_options = ["CPU"]
+    if cuda_count > 0:
+        device_options.append("CUDA")
+    device_label = st.selectbox("Compute device", device_options)
+
+    cpu_threads = int(
+        st.number_input(
+            "CPU threads",
+            min_value=1,
+            max_value=max(1, logical_cpus),
+            value=default_threads,
+            disabled=device_label == "CUDA",
+            help="CTranslate2 uses these OpenMP threads on CPU.",
+        )
     )
-    st.write(f"**Model:** `{MODEL_ID}`")
-    st.write(
-        "**Runtime:** "
-        + (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
+    beam_size = int(
+        st.selectbox(
+            "Beam size",
+            options=[1, 5],
+            index=0,
+            help="1 is much faster; 5 may improve accuracy slightly.",
+        )
     )
+
+    st.write(f"**Logical CPU threads:** {logical_cpus}")
+    st.write(f"**CTranslate2 CUDA devices:** {cuda_count}")
+    st.write(f"**Model:** `{MODEL_OPTIONS[model_label]}`")
+
     if ffmpeg_ready:
         st.success("FFmpeg detected")
         st.caption(ffmpeg_path)
     else:
         st.error("FFmpeg not detected")
-    st.caption("The model downloads to the Hugging Face cache on first use.")
 
 if not ffmpeg_ready:
     st.error(
-        "FFmpeg and FFprobe are required to read uploaded audio. "
-        "Install FFmpeg, close this terminal, open a new PowerShell window, "
-        "and run the app again."
-    )
-    st.code(
-        'winget install "FFmpeg (Essentials Build)"\n'
-        'ffmpeg -version\n'
-        'ffprobe -version',
-        language="powershell",
+        "FFmpeg and FFprobe are required to normalise uploaded audio. "
+        "Install FFmpeg and restart PowerShell before running this app."
     )
 
 uploaded = st.file_uploader("Upload audio", type=AUDIO_TYPES)
@@ -263,51 +251,79 @@ if uploaded:
             with st.spinner("Decoding audio to 16 kHz mono WAV…"):
                 convert_to_whisper_wav(source_path, wav_path)
 
-            with st.spinner("Loading Whisper and transcribing locally…"):
-                started = time.perf_counter()
-                asr, device = load_whisper()
-                language = LANGUAGES[language_label]
-                task = "transcribe" if language == "english" else "translate"
-                generate_kwargs: dict[str, str] = {"task": task}
-                if language:
-                    generate_kwargs["language"] = language
+            model_name = MODEL_OPTIONS[model_label]
+            device = "cuda" if device_label == "CUDA" else "cpu"
+            compute_type = "float16" if device == "cuda" else "int8"
 
-                result = asr(
-                    wav_path,
-                    batch_size=int(batch_size),
-                    return_timestamps=True,
-                    generate_kwargs=generate_kwargs,
-                )
-                elapsed = time.perf_counter() - started
+            status = st.empty()
+            progress = st.progress(0, text="Loading the transcription model…")
+            started = time.perf_counter()
 
-            transcript = str(result.get("text", "")).strip()
+            model = load_whisper(model_name, device, compute_type, cpu_threads)
+            language = LANGUAGES[language_label]
+            task = "transcribe" if language == "en" else "translate"
+
+            status.info(
+                f"Transcribing on {device.upper()} with {compute_type}; "
+                f"model={model_name}, CPU threads={cpu_threads if device == 'cpu' else 'n/a'}"
+            )
+
+            segments, info = model.transcribe(
+                wav_path,
+                language=language,
+                task=task,
+                beam_size=beam_size,
+                vad_filter=True,
+                condition_on_previous_text=False,
+                word_timestamps=False,
+            )
+
+            text_parts: list[str] = []
+            total_duration = float(info.duration or duration or 0)
+            for segment in segments:
+                clean_segment = segment.text.strip()
+                if clean_segment:
+                    text_parts.append(clean_segment)
+                if total_duration > 0:
+                    percentage = min(100, max(0, int((segment.end / total_duration) * 100)))
+                    progress.progress(
+                        percentage,
+                        text=f"Transcribing… {percentage}% ({segment.end / 60:.1f} min processed)",
+                    )
+
+            elapsed = time.perf_counter() - started
+            progress.progress(100, text="Transcription complete")
+            status.empty()
+
+            transcript = " ".join(text_parts).strip()
             if normalise:
                 transcript = uk_english(transcript)
+
+            if not transcript:
+                raise RuntimeError(
+                    "No speech was transcribed. Check that the file contains audible speech "
+                    "and select its spoken language explicitly."
+                )
 
             st.session_state.transcript = transcript
             st.session_state.filename = output_name(uploaded.name)
             st.session_state.elapsed = elapsed
-            st.session_state.duration = duration
-            st.session_state.device = device
+            st.session_state.duration = duration or info.duration
+            st.session_state.runtime = f"{device.upper()} / {compute_type} / {model_name}"
+            st.session_state.token_count = count_tokens(model, transcript)
             st.success("Transcription complete.")
 
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            st.error(
-                "GPU memory is insufficient. Set batch size to 1, close GPU-heavy "
-                "programs, or use CPU PyTorch."
-            )
         except Exception as exc:
             st.error(f"Transcription failed: {exc}")
             st.info(
-                "The app first converts the upload to a standard 16 kHz mono WAV. "
-                "If FFmpeg reports a decoding error, test the original file directly "
-                "with ffprobe or re-export the recording."
+                "For reliable CPU use, select Large v3 Turbo, CPU, 4–8 threads, "
+                "and beam size 1. CUDA requires compatible NVIDIA runtime libraries."
             )
         finally:
-            for temp_path in (source_path, wav_path):
-                if temp_path:
-                    Path(temp_path).unlink(missing_ok=True)
+            if source_path:
+                Path(source_path).unlink(missing_ok=True)
+            if wav_path:
+                Path(wav_path).unlink(missing_ok=True)
 
 if "transcript" in st.session_state:
     st.subheader("Transcript")
@@ -317,23 +333,20 @@ if "transcript" in st.session_state:
         height=360,
         label_visibility="collapsed",
     )
-    asr, _ = load_whisper()
-    token_count = (
-        len(asr.tokenizer.encode(text, add_special_tokens=False)) if text else 0
-    )
     words = len(text.split())
     elapsed = float(st.session_state.get("elapsed", 0))
     duration = st.session_state.get("duration")
 
     columns = st.columns(4)
     columns[0].metric("Words", f"{words:,}")
-    columns[1].metric("Text tokens", f"{token_count:,}")
+    columns[1].metric("Text tokens", f"{int(st.session_state.get('token_count', 0)):,}")
     columns[2].metric("Runtime", f"{elapsed:.1f} s")
     columns[3].metric(
         "Real-time factor",
         f"{elapsed / duration:.2f}×" if duration else "Unknown",
     )
 
+    st.caption(str(st.session_state.get("runtime", "")))
     st.caption(
         "The token count uses Whisper's tokenizer and is informational only. "
         "Local inference uses zero billable OpenAI API tokens."
