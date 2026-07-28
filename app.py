@@ -311,7 +311,10 @@ if uploaded:
             st.session_state.duration = duration or info.duration
             st.session_state.runtime = f"{device.upper()} / {compute_type} / {model_name}"
             st.session_state.token_count = count_tokens(model, transcript)
-            st.success("Transcription complete.")
+            st.success(
+                "Transcription complete. Review the text below, then click "
+                "Download transcript (.txt) to save it."
+            )
 
         except Exception as exc:
             st.error(f"Transcription failed: {exc}")
@@ -327,6 +330,11 @@ if uploaded:
 
 if "transcript" in st.session_state:
     st.subheader("Transcript")
+    st.info(
+        "This transcript is not saved automatically. Review or edit it, then use "
+        "the download button below. Your browser will save it to its configured "
+        "Downloads folder or ask you to choose a location."
+    )
     text = st.text_area(
         "Review and edit",
         key="transcript",
