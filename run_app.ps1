@@ -26,6 +26,9 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
     }
 }
 
+# On Windows without Developer Mode, Hugging Face may fail to create cache
+# symlinks with WinError 1314. Force the supported copy-based cache mode.
+$env:HF_HUB_DISABLE_SYMLINKS = "1"
 $env:HF_HUB_DISABLE_SYMLINKS_WARNING = "1"
 
 & $PythonExe -m streamlit run (Join-Path $PSScriptRoot "app.py")
